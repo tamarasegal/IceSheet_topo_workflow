@@ -336,8 +336,38 @@ def main():
                 elif theta < lat_landm[0] * DEG2RAD + TINY:
                     landm_coslat_cube[i, j, k] = 1.0
                 else:
-                    # Simplified bilinear interpolation (would need proper implementation)
-                    landm_coslat_cube[i, j, k] = 0.5  # Placeholder
+                    # Proper bilinear interpolation
+                    ilon = max(min(int((lambda_coord - lon_landm[0]*DEG2RAD)/dx_landm), im_landm-1), 0)
+                    ip1 = (ilon + 1) % im_landm  # Handle wraparound
+                    wx = (lambda_coord - lon_landm[ilon]*DEG2RAD) / dx_landm
+                    
+                    # Find latitude index (with search for non-uniform spacing)
+                    dy_landm = DEG2RAD * (lat_landm[1] - lat_landm[0])  # rough estimate
+                    ilat = max(min(int((theta - lat_landm[0]*DEG2RAD)/dy_landm), jm_landm-2), 0)
+                    jp1 = ilat + 1
+                    wy = (theta - lat_landm[ilat]*DEG2RAD) / ((lat_landm[jp1] - lat_landm[ilat])*DEG2RAD)
+                    
+                    # Search for correct latitude bounds (since spacing may be non-uniform)
+                    while (wy > 1.0 or wy < 0.0) and 0 <= ilat < jm_landm-1:
+                        jp1 = ilat + 1
+                        wy = (theta - lat_landm[ilat]*DEG2RAD) / ((lat_landm[jp1] - lat_landm[ilat])*DEG2RAD)
+                        if wy > 1.0:
+                            ilat += 1
+                        elif wy < 0.0:
+                            ilat -= 1
+                    
+                    # Bounds checking
+                    if not (0.0 <= wx <= 1.0 + TINY and 0.0 <= wy <= 1.0 + TINY):
+                        print(f"Warning: interpolation weights out of range: wx={wx}, wy={wy}")
+                        landm_coslat_cube[i, j, k] = 0.5
+                    else:
+                        # Actual bilinear interpolation
+                        landm_coslat_cube[i, j, k] = (
+                            (1.0-wx)*(1.0-wy)*landm_coslat[ilat, ilon] + 
+                            wx*(1.0-wy)*landm_coslat[ilat, ip1] +
+                            (1.0-wx)*wy*landm_coslat[jp1, ilon] + 
+                            wx*wy*landm_coslat[jp1, ip1]
+                        )
     
     print(f"min/max value of terr_cube: {np.min(terr_cube)}, {np.max(terr_cube)}")
     print(f"min/max value of landm_coslat_cube: {np.min(landm_coslat_cube)}, {np.max(landm_coslat_cube)}")
