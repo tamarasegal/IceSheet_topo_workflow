@@ -55,17 +55,26 @@ class TerrainProcessor:
         self.lat_landm = None
         self.im_landm = None
         self.jm_landm = None
+        self.data_is_360_longitude = False  # Track if longitude wraps around
     
     def _read_config(self, config_file: str) -> dict:
         """Read configuration from INI file (replacing Fortran namelist)"""
-        if not os.path.exists(config_file):
-            # Create default config if it doesn't exist
-            self._create_default_config(config_file)
+        config_exists = os.path.exists(config_file)
+        
+        if not config_exists:
+            print(f"Warning: Config file {config_file} not found.")
+            response = input("Create default config file? (y/n): ").strip().lower()
+            if response == 'y':
+                self._create_default_config(config_file)
+                print(f"Please edit {config_file} with your actual filenames and re-run.")
+                sys.exit(0)
+            else:
+                print("Cannot proceed without configuration.")
+                sys.exit(1)
         
         config = configparser.ConfigParser()
-        config.read(config_file)
-        
         try:
+            config.read(config_file)
             return {
                 'raw_latlon_data_file': config.get('binparams', 'raw_latlon_data_file'),
                 'output_file': config.get('binparams', 'output_file'),
@@ -90,7 +99,15 @@ class TerrainProcessor:
             config.write(f)
         
         print(f"Created default config file: {config_file}")
-        print("Please edit the file with your actual input/output filenames")
+    
+    def _check_file_overwrite(self, filename: str):
+        """Check if file exists and warn user about overwrite"""
+        if os.path.exists(filename):
+            print(f"Warning: Output file {filename} already exists.")
+            response = input("Overwrite? (y/n): ").strip().lower()
+            if response != 'y':
+                print("Operation cancelled.")
+                sys.exit(0)
     
     def _validate_netcdf_file(self, filename: str, required_vars: list) -> bool:
         """Validate that NetCDF file exists and has required variables"""
@@ -103,11 +120,15 @@ class TerrainProcessor:
                 missing_vars = [var for var in required_vars if var not in ncfile.variables]
                 if missing_vars:
                     print(f"Error: Missing variables in {filename}: {missing_vars}")
+                    available_vars = list(ncfile.variables.keys())
+                    print(f"Available variables: {available_vars}")
                     return False
                 
                 # Check for required dimensions
                 if 'lat' not in ncfile.dimensions or 'lon' not in ncfile.dimensions:
                     print(f"Error: Missing required dimensions (lat, lon) in {filename}")
+                    available_dims = list(ncfile.dimensions.keys())
+                    print(f"Available dimensions: {available_dims}")
                     return False
                     
         except Exception as e:
@@ -115,6 +136,18 @@ class TerrainProcessor:
             return False
         
         return True
+    
+    def _safe_progress_report(self, processed: int, total: int, message: str = "Progress"):
+        """Safe progress reporting that handles small datasets"""
+        if total == 0:
+            return
+        
+        # Use max of 100 or total//20 to avoid division by zero
+        report_interval = max(1, min(total // 20, total // 100))
+        
+        if processed % report_interval == 0 or processed == total - 1:
+            progress = 100.0 * processed / total
+            print(f"{message}: {progress:.1f}% done", end='\r')
     
     def read_terrain_data(self):
         """Read terrain data from NetCDF file with comprehensive error checking"""
@@ -135,20 +168,38 @@ class TerrainProcessor:
                 if self.im < 2 or self.jm < 2:
                     raise ValueError(f"Invalid grid dimensions: {self.im} x {self.jm}")
                 
-                # Read data with proper data type handling
-                try:
-                    self.landfrac = ncfile.variables['landfract'][:].astype(np.float64)
-                    self.terr = ncfile.variables['htopo'][:].astype(np.float64)
-                    self.lon = ncfile.variables['lon'][:].astype(np.float64)
-                    self.lat = ncfile.variables['lat'][:].astype(np.float64)
-                except Exception as e:
-                    raise ValueError(f"Error reading data arrays: {e}")
+                # Read coordinate arrays first to determine data types
+                self.lon = ncfile.variables['lon'][:].astype(np.float64)
+                self.lat = ncfile.variables['lat'][:].astype(np.float64)
                 
-                # Validate data shapes
-                if self.landfrac.shape != (self.jm, self.im):
-                    raise ValueError(f"landfract shape mismatch: expected ({self.jm}, {self.im}), got {self.landfrac.shape}")
-                if self.terr.shape != (self.jm, self.im):
-                    raise ValueError(f"htopo shape mismatch: expected ({self.jm}, {self.im}), got {self.terr.shape}")
+                # Read data arrays, preserving original data types initially
+                landfrac_var = ncfile.variables['landfract']
+                terr_var = ncfile.variables['htopo']
+                
+                # Get original data (might be integer types)
+                landfrac_raw = landfrac_var[:]
+                terr_raw = terr_var[:]
+                
+                # Handle fill values before type conversion
+                landfrac_fill = getattr(landfrac_var, '_FillValue', None)
+                terr_fill = getattr(terr_var, '_FillValue', None)
+                
+                # Convert to float64 and handle fill values
+                self.landfrac = landfrac_raw.astype(np.float64)
+                self.terr = terr_raw.astype(np.float64)
+                
+                if landfrac_fill is not None:
+                    self.landfrac = np.where(landfrac_raw == landfrac_fill, -99.0, self.landfrac)
+                
+                if terr_fill is not None:
+                    self.terr = np.where(terr_raw == terr_fill, -9999.0, self.terr)
+                
+                # Validate data shapes (NetCDF convention: [lat, lon])
+                expected_shape = (self.jm, self.im)
+                if self.landfrac.shape != expected_shape:
+                    raise ValueError(f"landfract shape mismatch: expected {expected_shape}, got {self.landfrac.shape}")
+                if self.terr.shape != expected_shape:
+                    raise ValueError(f"htopo shape mismatch: expected {expected_shape}, got {self.terr.shape}")
                 if len(self.lon) != self.im:
                     raise ValueError(f"lon length mismatch: expected {self.im}, got {len(self.lon)}")
                 if len(self.lat) != self.jm:
@@ -160,14 +211,10 @@ class TerrainProcessor:
                 if np.any(self.lat < -90) or np.any(self.lat > 90):
                     raise ValueError("Latitude values outside valid range [-90, 90]")
                 
-                # Handle fill values and invalid data
-                fill_value = getattr(ncfile.variables['htopo'], '_FillValue', None)
-                if fill_value is not None:
-                    self.terr = np.where(self.terr == fill_value, -9999, self.terr)
-                
-                fill_value = getattr(ncfile.variables['landfract'], '_FillValue', None)
-                if fill_value is not None:
-                    self.landfrac = np.where(self.landfrac == fill_value, -99.0, self.landfrac)
+                # Check if longitude spans 360 degrees (for wraparound logic)
+                lon_range = np.max(self.lon) - np.min(self.lon)
+                self.data_is_360_longitude = (lon_range >= 359.0)
+                print(f"Longitude range: {lon_range:.1f} degrees (wraparound: {self.data_is_360_longitude})")
                 
                 print(f"min/max of 30sec land fraction: {np.min(self.landfrac):.3f}, {np.max(self.landfrac):.3f}")
                 print(f"min/max of terrain elevation: {np.min(self.terr):.1f}, {np.max(self.terr):.1f}")
@@ -198,16 +245,18 @@ class TerrainProcessor:
                     raise ValueError(f"Invalid LANDM_COSLAT grid dimensions: {self.im_landm} x {self.jm_landm}")
                 
                 # Read data
-                self.landm_coslat = ncfile.variables['LANDM_COSLAT'][:].astype(np.float64)
+                landm_var = ncfile.variables['LANDM_COSLAT']
+                self.landm_coslat = landm_var[:].astype(np.float64)
                 self.lon_landm = ncfile.variables['lon'][:].astype(np.float64)
                 self.lat_landm = ncfile.variables['lat'][:].astype(np.float64)
                 
                 # Validate shapes
-                if self.landm_coslat.shape != (self.jm_landm, self.im_landm):
-                    raise ValueError(f"LANDM_COSLAT shape mismatch: expected ({self.jm_landm}, {self.im_landm}), got {self.landm_coslat.shape}")
+                expected_shape = (self.jm_landm, self.im_landm)
+                if self.landm_coslat.shape != expected_shape:
+                    raise ValueError(f"LANDM_COSLAT shape mismatch: expected {expected_shape}, got {self.landm_coslat.shape}")
                 
                 # Handle fill values
-                fill_value = getattr(ncfile.variables['LANDM_COSLAT'], '_FillValue', None)
+                fill_value = getattr(landm_var, '_FillValue', None)
                 if fill_value is not None:
                     self.landm_coslat = np.where(self.landm_coslat == fill_value, -999999.99, self.landm_coslat)
                 
@@ -245,7 +294,8 @@ class TerrainProcessor:
                 darea_latlon = dx_rad * (math.sin(DEG2RAD * lat_north) - 
                                        math.sin(DEG2RAD * lat_south))
                 
-                if not math.isnan(self.terr[j, i]) and self.terr[j, i] != -9999:
+                # Use consistent indexing: [j, i] for [lat, lon]
+                if not (np.isnan(self.terr[j, i]) or self.terr[j, i] == -9999):
                     vol += float(self.terr[j, i]) * darea_latlon
                 
                 area_latlon += darea_latlon
@@ -312,7 +362,7 @@ class TerrainProcessor:
         return alpha, beta, ipanel
     
     def cubed_sphere_xyz_from_abp(self, alpha: float, beta: float, ipanel: int) -> Tuple[float, float, float]:
-        """Convert cubed sphere coordinates to Cartesian coordinates"""
+        """Convert cubed sphere coordinates to Cartesian coordinates (no normalization)"""
         if not (1 <= ipanel <= 6):
             raise ValueError(f"Panel out of range: {ipanel}")
         
@@ -346,17 +396,10 @@ class TerrainProcessor:
         return xx, yy, zz
     
     def cubed_sphere_rll_from_abp(self, alpha: float, beta: float, ipanel: int) -> Tuple[float, float]:
-        """Convert cubed sphere coordinates back to lat-lon"""
+        """Convert cubed sphere coordinates back to lat-lon (following original Fortran)"""
         xx, yy, zz = self.cubed_sphere_xyz_from_abp(alpha, beta, ipanel)
         
-        # Normalize to unit sphere
-        norm = math.sqrt(xx*xx + yy*yy + zz*zz)
-        if norm < TINY:
-            raise ValueError("Degenerate point in coordinate conversion")
-        
-        xx, yy, zz = xx/norm, yy/norm, zz/norm
-        
-        # Convert to lat-lon
+        # Convert to lat-lon (no additional normalization - following original Fortran)
         if abs(zz) > 1.0:
             zz = math.copysign(1.0, zz)  # Handle numerical precision issues
         
@@ -366,7 +409,7 @@ class TerrainProcessor:
             lon = 0.0
         else:
             lon = math.atan2(yy, xx) + ROTATE_CUBE
-            # Normalize longitude to [0, 2π]
+            # Normalize longitude to [0, 2π] (following original Fortran)
             while lon < 0.0:
                 lon += 2.0 * PI
             while lon >= 2.0 * PI:
@@ -436,14 +479,12 @@ class TerrainProcessor:
         idp = np.zeros((self.im, self.jm), dtype=np.int32)
         
         total_points = self.im * self.jm
-        processed = 0
         
         for j in range(self.jm):
             for i in range(self.im):
                 # Progress reporting
-                if processed % (total_points // 20) == 0:
-                    progress = 100.0 * processed / total_points
-                    print(f"Progress: {progress:.1f}% done", end='\r')
+                processed = i + j * self.im
+                self._safe_progress_report(processed, total_points, "Binning")
                 
                 try:
                     alpha, beta, ipanel = self.cubed_sphere_abp_from_rll(lon_rad[i], lat_rad[j])
@@ -477,10 +518,11 @@ class TerrainProcessor:
                     panel_idx = ipanel - 1  # Convert to 0-based
                     weight[icube, jcube, panel_idx] += wt
                     
-                    if not (math.isnan(self.terr[j, i]) or self.terr[j, i] == -9999):
+                    # Use consistent indexing: self.terr[j, i] for [lat, lon]
+                    if not (np.isnan(self.terr[j, i]) or self.terr[j, i] == -9999):
                         terr_cube[icube, jcube, panel_idx] += wt * float(self.terr[j, i])
                     
-                    if not (math.isnan(self.landfrac[j, i]) or self.landfrac[j, i] == -99.0):
+                    if not (np.isnan(self.landfrac[j, i]) or self.landfrac[j, i] == -99.0):
                         landfrac_cube[icube, jcube, panel_idx] += wt * float(self.landfrac[j, i])
                     
                     # Store indices for variance computation
@@ -491,8 +533,6 @@ class TerrainProcessor:
                 except Exception as e:
                     print(f"\nError processing point ({i},{j}): {e}")
                     sys.exit(1)
-                
-                processed += 1
         
         print("\nBinning completed")
         
@@ -507,21 +547,18 @@ class TerrainProcessor:
         # Grid spacing in LANDM_COSLAT data
         dx_landm = DEG2RAD * (self.lon_landm[1] - self.lon_landm[0])
         
-        # Check for uniform spacing
-        lon_diffs = np.diff(self.lon_landm)
-        if not np.allclose(lon_diffs, lon_diffs[0], rtol=1e-6):
-            print("Warning: non-uniform longitude spacing in LANDM_COSLAT data")
+        # Check if LANDM_COSLAT longitude wraps around
+        lon_landm_range = np.max(self.lon_landm) - np.min(self.lon_landm)
+        landm_is_360_longitude = (lon_landm_range >= 359.0)
         
         total_points = 6 * self.ncube * self.ncube
-        processed = 0
         
         for k in range(6):
             for j in range(self.ncube):
                 for i in range(self.ncube):
                     # Progress reporting
-                    if processed % (total_points // 20) == 0:
-                        progress = 100.0 * processed / total_points
-                        print(f"Interpolation progress: {progress:.1f}%", end='\r')
+                    processed = i + j * self.ncube + k * self.ncube * self.ncube
+                    self._safe_progress_report(processed, total_points, "Interpolating")
                     
                     try:
                         # Compute center of cubed sphere cell
@@ -543,7 +580,12 @@ class TerrainProcessor:
                             # Find longitude index
                             lon_norm = lambda_coord - self.lon_landm[0] * DEG2RAD
                             ilon = max(min(int(lon_norm / dx_landm), self.im_landm - 1), 0)
-                            ip1 = (ilon + 1) % self.im_landm  # Handle wraparound
+                            
+                            # Only use wraparound if longitude actually spans 360 degrees
+                            if landm_is_360_longitude:
+                                ip1 = (ilon + 1) % self.im_landm
+                            else:
+                                ip1 = min(ilon + 1, self.im_landm - 1)
                             
                             wx = (lon_norm - ilon * dx_landm) / dx_landm
                             wx = max(0.0, min(1.0, wx))  # Clamp to [0,1]
@@ -581,7 +623,6 @@ class TerrainProcessor:
                             if search_count >= search_limit:
                                 print(f"\nWarning: latitude search failed at ({i},{j},{k})")
                                 landm_coslat_cube[i, j, k] = 0.5
-                                processed += 1
                                 continue
                             
                             jp1 = ilat + 1
@@ -594,12 +635,13 @@ class TerrainProcessor:
                                 wy = (theta - lat_ilat) / (lat_jp1 - lat_ilat)
                                 wy = max(0.0, min(1.0, wy))  # Clamp to [0,1]
                             
-                            # Bounds checking
-                            if not (0 <= ilon < self.im_landm and 0 <= ilat < self.jm_landm-1):
+                            # Bounds checking with corrected condition
+                            if not (0 <= ilon < self.im_landm and 0 <= ip1 < self.im_landm and 
+                                   0 <= ilat < self.jm_landm - 1 and 0 <= jp1 < self.jm_landm):
                                 print(f"\nError: interpolation indices out of bounds at ({i},{j},{k})")
-                                print(f"ilon={ilon}, ilat={ilat}, im_landm={self.im_landm}, jm_landm={self.jm_landm}")
+                                print(f"ilon={ilon}, ip1={ip1}, ilat={ilat}, jp1={jp1}")
+                                print(f"Bounds: im_landm={self.im_landm}, jm_landm={self.jm_landm}")
                                 landm_coslat_cube[i, j, k] = 0.5
-                                processed += 1
                                 continue
                             
                             # Perform bilinear interpolation
@@ -627,8 +669,6 @@ class TerrainProcessor:
                     except Exception as e:
                         print(f"\nError in LANDM_COSLAT interpolation at ({i},{j},{k}): {e}")
                         landm_coslat_cube[i, j, k] = 0.5
-                    
-                    processed += 1
         
         print("\nLANDM_COSLAT interpolation completed")
         return landm_coslat_cube
@@ -682,7 +722,7 @@ class TerrainProcessor:
         for ipanel in range(6):
             for j in range(self.ncube):
                 for i in range(self.ncube):
-                    if not (math.isnan(terr_cube[i, j, ipanel]) or math.isinf(terr_cube[i, j, ipanel])):
+                    if not (np.isnan(terr_cube[i, j, ipanel]) or np.isinf(terr_cube[i, j, ipanel])):
                         vol_cube += terr_cube[i, j, ipanel] * darea_cube[i, j]
         
         vol_cube = vol_cube / (4.0 * PI)
@@ -700,14 +740,12 @@ class TerrainProcessor:
         dlat = PI / self.jm
         
         total_points = self.im * self.jm
-        processed = 0
         
         for j in range(self.jm):
             for i in range(self.im):
                 # Progress reporting
-                if processed % (total_points // 20) == 0:
-                    progress = 100.0 * processed / total_points
-                    print(f"Variance computation progress: {progress:.1f}%", end='\r')
+                processed = i + j * self.im
+                self._safe_progress_report(processed, total_points, "Computing variance")
                 
                 icube = idx[i, j]
                 jcube = idy[i, j]
@@ -719,9 +757,8 @@ class TerrainProcessor:
                     print(f"icube={icube}, jcube={jcube}, ipanel={ipanel}")
                     continue
                 
-                # Skip invalid terrain values
-                if math.isnan(self.terr[j, i]) or self.terr[j, i] == -9999:
-                    processed += 1
+                # Skip invalid terrain values (consistent indexing: [j, i] for [lat, lon])
+                if np.isnan(self.terr[j, i]) or self.terr[j, i] == -9999:
                     continue
                 
                 wt = math.sin(lat_rad[j] + 0.5 * dlat) - math.sin(lat_rad[j] - 0.5 * dlat)
@@ -729,8 +766,6 @@ class TerrainProcessor:
                 if weight[icube, jcube, ipanel] > 0:
                     diff = terr_cube[icube, jcube, ipanel] - self.terr[j, i]
                     var30_cube[icube, jcube, ipanel] += (wt * diff**2) / weight[icube, jcube, ipanel]
-                
-                processed += 1
         
         print(f"\nmin/max value of var30_cube: {np.min(np.sqrt(var30_cube)):.2f}, {np.max(np.sqrt(var30_cube)):.2f}")
         
@@ -738,50 +773,14 @@ class TerrainProcessor:
     
     def write_output_file(self, terr_cube: np.ndarray, landfrac_cube: np.ndarray, 
                          landm_coslat_cube: np.ndarray, var30_cube: np.ndarray):
-        """Write cubed sphere data to NetCDF file"""
+        """Write cubed sphere data to NetCDF file with memory-efficient approach"""
         print(f"Creating NetCDF file for output: {self.output_file}")
         
-        # Flatten arrays for output (Fortran column-major order)
+        # Check for file overwrite
+        self._check_file_overwrite(self.output_file)
+        
         grid_dims = 6 * self.ncube * self.ncube
-        
-        # Compute grid center coordinates
-        grid_center_lat = np.zeros(grid_dims, dtype=np.float64)
-        grid_center_lon = np.zeros(grid_dims, dtype=np.float64)
-        
         da = PI / (2 * self.ncube)
-        atm_add = 0
-        
-        for k in range(6):
-            for j in range(self.ncube):
-                ygno_ce = -PIQ + da * (j + 0.5)
-                for i in range(self.ncube):
-                    xgno_ce = -PIQ + da * (i + 0.5)
-                    try:
-                        lon, lat = self.cubed_sphere_rll_from_abp(xgno_ce, ygno_ce, k + 1)
-                        grid_center_lon[atm_add] = lon * RAD2DEG
-                        grid_center_lat[atm_add] = lat * RAD2DEG
-                    except Exception as e:
-                        print(f"Error computing grid coordinates for cell ({i},{j},{k}): {e}")
-                        grid_center_lon[atm_add] = 0.0
-                        grid_center_lat[atm_add] = 0.0
-                    
-                    atm_add += 1
-        
-        # Flatten data arrays (using Fortran-style column-major order)
-        terr_flat = np.zeros(grid_dims, dtype=np.float64)
-        landfrac_flat = np.zeros(grid_dims, dtype=np.float64)
-        landm_coslat_flat = np.zeros(grid_dims, dtype=np.float64)
-        var30_flat = np.zeros(grid_dims, dtype=np.float64)
-        
-        atm_add = 0
-        for k in range(6):
-            for j in range(self.ncube):
-                for i in range(self.ncube):
-                    terr_flat[atm_add] = terr_cube[i, j, k]
-                    landfrac_flat[atm_add] = landfrac_cube[i, j, k]
-                    landm_coslat_flat[atm_add] = landm_coslat_cube[i, j, k]
-                    var30_flat[atm_add] = var30_cube[i, j, k]
-                    atm_add += 1
         
         try:
             with nc.Dataset(self.output_file, 'w', format='NETCDF4') as ncfile:
@@ -830,16 +829,68 @@ class TerrainProcessor:
                 var30_var.long_name = 'variance of elevation from high res lat-lon to ~3km cubed-sphere'
                 var30_var.description = 'subgrid variance of surface elevation'
                 
-                # Write data
+                # Write grid dimensions first
                 grid_dims_var[:] = grid_dims
-                lat_var[:] = grid_center_lat
-                lon_var[:] = grid_center_lon
-                terr_var[:] = terr_flat
-                landfrac_var[:] = landfrac_flat
-                landm_coslat_var[:] = landm_coslat_flat
-                var30_var[:] = var30_flat
                 
-                # Add some diagnostic information
+                # Write data in chunks to save memory
+                print("Writing coordinate and data arrays...")
+                chunk_size = min(100000, grid_dims)  # Process in chunks
+                
+                for start_idx in range(0, grid_dims, chunk_size):
+                    end_idx = min(start_idx + chunk_size, grid_dims)
+                    chunk_len = end_idx - start_idx
+                    
+                    # Compute coordinates for this chunk
+                    chunk_lat = np.zeros(chunk_len, dtype=np.float64)
+                    chunk_lon = np.zeros(chunk_len, dtype=np.float64)
+                    chunk_terr = np.zeros(chunk_len, dtype=np.float64)
+                    chunk_landfrac = np.zeros(chunk_len, dtype=np.float64)
+                    chunk_landm = np.zeros(chunk_len, dtype=np.float64)
+                    chunk_var30 = np.zeros(chunk_len, dtype=np.float64)
+                    
+                    atm_add = 0
+                    for linear_idx in range(start_idx, end_idx):
+                        # Convert linear index back to (k, j, i) using Fortran-style ordering
+                        temp = linear_idx
+                        k = temp // (self.ncube * self.ncube)
+                        temp = temp % (self.ncube * self.ncube)
+                        j = temp // self.ncube
+                        i = temp % self.ncube
+                        
+                        # Compute grid center coordinates
+                        ygno_ce = -PIQ + da * (j + 0.5)
+                        xgno_ce = -PIQ + da * (i + 0.5)
+                        
+                        try:
+                            lon, lat = self.cubed_sphere_rll_from_abp(xgno_ce, ygno_ce, k + 1)
+                            chunk_lon[atm_add] = lon * RAD2DEG
+                            chunk_lat[atm_add] = lat * RAD2DEG
+                        except Exception as e:
+                            print(f"Error computing coordinates for cell ({i},{j},{k}): {e}")
+                            chunk_lon[atm_add] = 0.0
+                            chunk_lat[atm_add] = 0.0
+                        
+                        # Copy data
+                        chunk_terr[atm_add] = terr_cube[i, j, k]
+                        chunk_landfrac[atm_add] = landfrac_cube[i, j, k]
+                        chunk_landm[atm_add] = landm_coslat_cube[i, j, k]
+                        chunk_var30[atm_add] = var30_cube[i, j, k]
+                        
+                        atm_add += 1
+                    
+                    # Write chunk to file
+                    lat_var[start_idx:end_idx] = chunk_lat
+                    lon_var[start_idx:end_idx] = chunk_lon
+                    terr_var[start_idx:end_idx] = chunk_terr
+                    landfrac_var[start_idx:end_idx] = chunk_landfrac
+                    landm_coslat_var[start_idx:end_idx] = chunk_landm
+                    var30_var[start_idx:end_idx] = chunk_var30
+                    
+                    # Progress reporting
+                    progress = 100.0 * end_idx / grid_dims
+                    print(f"Writing progress: {progress:.1f}%", end='\r')
+                
+                # Add diagnostic information
                 ncfile.input_dimensions = f'{self.im} x {self.jm}'
                 ncfile.output_dimensions = f'{self.ncube} x {self.ncube} x 6'
                 ncfile.total_input_points = self.im * self.jm
@@ -849,7 +900,7 @@ class TerrainProcessor:
             print(f"Error writing output file: {e}")
             sys.exit(1)
         
-        print(f"Successfully wrote output file: {self.output_file}")
+        print(f"\nSuccessfully wrote output file: {self.output_file}")
     
     def run(self):
         """Main processing pipeline"""
