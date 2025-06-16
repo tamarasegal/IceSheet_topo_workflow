@@ -321,7 +321,9 @@ def main():
         for j in range(ncube):
             for i in range(ncube):
                 if abs(weight[i, j, k]) < 1.0e-9:
-                    print(f"Warning: no lat-lon grid point in cubed sphere cell {i}, {j}, {k}")
+                    print(f"FATAL ERROR: no lat-lon grid point in cubed sphere cell {i}, {j}, {k}")
+                    print("This indicates insufficient input resolution or coordinate transformation error")
+                    sys.exit(1)
                 else:
                     terr_cube[i, j, k] /= weight[i, j, k]
                     landfrac_cube[i, j, k] /= weight[i, j, k]
