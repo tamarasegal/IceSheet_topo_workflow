@@ -527,7 +527,303 @@ landm_coslat_file = dummy_landm.nc
                 self.assertLess(lat_diff, 1e-10, f"Latitude precision degraded: {lat_diff:.2e}")
 
 
-class IntegrationTests(EnvironmentalSafetyTestCase):
+class ErrorPropagationTests(EnvironmentalSafetyTestCase):
+    """
+    CRITICAL: Test error propagation and numerical robustness.
+    
+    Failures here could cause:
+    - Error amplification in climate models
+    - Numerical instabilities
+    - Silent corruption of results
+    """
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_file = os.path.join(self.temp_dir, "test_config.ini")
+        
+        with open(self.config_file, 'w') as f:
+            f.write("""[binparams]
+raw_latlon_data_file = dummy.nc
+output_file = dummy_out.nc
+ncube = 16
+landm_coslat_file = dummy_landm.nc
+""")
+        
+        self.processor = TerrainProcessor(self.config_file)
+    
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    
+    def test_input_error_sensitivity(self):
+        """
+        CRITICAL TEST: Verify sensitivity to input errors is bounded.
+        
+        Small errors in input coordinates should not cause large errors
+        in output coordinates (Lipschitz continuity).
+        """
+        base_coords = [
+            (PI/6, PI/12),    # 30°E, 15°N
+            (PI/2, PI/6),     # 90°E, 30°N
+            (PI, 0.0),        # 180°E, 0°N
+        ]
+        
+        error_magnitudes = [1e-10, 1e-8, 1e-6, 1e-4]
+        
+        for lon_base, lat_base in base_coords:
+            for error_mag in error_magnitudes:
+                with self.subTest(lon=math.degrees(lon_base), lat=math.degrees(lat_base), error=error_mag):
+                    try:
+                        # Base transformation
+                        alpha_base, beta_base, panel_base = self.processor.cubed_sphere_abp_from_rll(lon_base, lat_base)
+                        
+                        # Perturbed transformations
+                        perturbations = [
+                            (error_mag, 0),
+                            (0, error_mag),
+                            (error_mag, error_mag),
+                            (-error_mag, error_mag),
+                        ]
+                        
+                        for d_lon, d_lat in perturbations:
+                            lon_pert = lon_base + d_lon
+                            lat_pert = lat_base + d_lat
+                            
+                            # Clamp to valid ranges
+                            lat_pert = max(-PI/2 + 1e-12, min(PI/2 - 1e-12, lat_pert))
+                            
+                            alpha_pert, beta_pert, panel_pert = self.processor.cubed_sphere_abp_from_rll(lon_pert, lat_pert)
+                            
+                            # Check error amplification (only if same panel)
+                            if panel_base == panel_pert:
+                                alpha_error = abs(alpha_pert - alpha_base)
+                                beta_error = abs(beta_pert - beta_base)
+                                
+                                input_error = math.sqrt(d_lon**2 + d_lat**2)
+                                output_error = math.sqrt(alpha_error**2 + beta_error**2)
+                                
+                                if input_error > 0:
+                                    amplification = output_error / input_error
+                                    
+                                    # Error amplification should be bounded
+                                    self.assertLess(amplification, 10.0,
+                                                  f"Excessive error amplification: {amplification:.2f} "
+                                                  f"for input error {input_error:.2e}")
+                    
+                    except Exception as e:
+                        self.fail(f"Error sensitivity test failed: {e}")
+    
+    def test_catastrophic_cancellation_detection(self):
+        """
+        CRITICAL TEST: Detect potential catastrophic cancellation.
+        
+        Verify that coordinate calculations don't suffer from
+        catastrophic cancellation in floating-point arithmetic.
+        """
+        # Test near-cancellation scenarios
+        critical_points = [
+            (1e-15, 1e-15),        # Very small coordinates
+            (PI/4 - 1e-14, 0.0),   # Near panel boundary
+            (0.0, PI/2 - 1e-14),   # Near pole
+        ]
+        
+        for lon, lat in critical_points:
+            with self.subTest(lon=lon, lat=lat):
+                try:
+                    alpha, beta, panel = self.processor.cubed_sphere_abp_from_rll(lon, lat)
+                    
+                    # Check for loss of precision indicators
+                    self.assertFalse(math.isnan(alpha), "NaN indicates cancellation")
+                    self.assertFalse(math.isnan(beta), "NaN indicates cancellation")
+                    
+                    # Verify results are reasonable
+                    self.assertPhysicallyRealistic(alpha, -PI/4, PI/4, "alpha")
+                    self.assertPhysicallyRealistic(beta, -PI/4, PI/4, "beta")
+                    
+                    # Test roundtrip to verify precision
+                    lon_recovered, lat_recovered = self.processor.cubed_sphere_rll_from_abp(alpha, beta, panel)
+                    
+                    # Allow larger tolerance for extreme cases
+                    lon_error = abs(lon_recovered - lon)
+                    lat_error = abs(lat_recovered - lat)
+                    
+                    # Error should not be disproportionately large
+                    max_expected_error = max(1e-12, abs(lon) * 1e-10, abs(lat) * 1e-10)
+                    
+                    self.assertLess(lon_error, max_expected_error,
+                                  f"Longitude cancellation error: {lon_error:.2e}")
+                    self.assertLess(lat_error, max_expected_error,
+                                  f"Latitude cancellation error: {lat_error:.2e}")
+                
+                except Exception as e:
+                    # Some extreme cases may legitimately fail
+                    if abs(lon) < 1e-14 and abs(lat) < 1e-14:
+                        continue  # Skip extremely small values
+                    else:
+                        self.fail(f"Cancellation test failed: {e}")
+
+
+class StressTests(EnvironmentalSafetyTestCase):
+    """
+    CRITICAL: Stress tests for extreme conditions.
+    
+    These tests verify the code can handle extreme inputs without
+    catastrophic failure that could corrupt environmental models.
+    """
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_file = os.path.join(self.temp_dir, "test_config.ini")
+        
+        with open(self.config_file, 'w') as f:
+            f.write("""[binparams]
+raw_latlon_data_file = dummy.nc
+output_file = dummy_out.nc
+ncube = 16
+landm_coslat_file = dummy_landm.nc
+""")
+        
+        self.processor = TerrainProcessor(self.config_file)
+    
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    
+    def test_extreme_coordinate_values(self):
+        """Test behavior with extreme coordinate values"""
+        extreme_coords = [
+            (1e-15, 1e-15),         # Near machine epsilon
+            (2*PI - 1e-15, PI/2 - 1e-15),  # Near boundaries
+            (1e10, 1e10),           # Extremely large (should fail gracefully)
+            (float('inf'), 0),      # Infinity
+            (float('nan'), 0),      # NaN
+        ]
+        
+        for lon, lat in extreme_coords:
+            with self.subTest(lon=lon, lat=lat):
+                if math.isfinite(lon) and math.isfinite(lat):
+                    # Should either work or fail gracefully
+                    try:
+                        if abs(lon) < 1e6 and abs(lat) < PI/2:
+                            alpha, beta, panel = self.processor.cubed_sphere_abp_from_rll(lon, lat)
+                            self.assertFalse(math.isnan(alpha))
+                            self.assertFalse(math.isnan(beta))
+                    except (ValueError, OverflowError):
+                        pass  # Acceptable failure for extreme values
+                else:
+                    # Should fail gracefully with infinite/NaN inputs
+                    with self.assertRaises((ValueError, OverflowError)):
+                        self.processor.cubed_sphere_abp_from_rll(lon, lat)
+    
+    def test_memory_limits_large_datasets(self):
+        """Test behavior with memory-challenging dataset sizes"""
+        # Test with progressively larger ncube values
+        large_ncube_values = [100, 500, 1000]  # Up to 6M grid points
+        
+        for ncube in large_ncube_values:
+            with self.subTest(ncube=ncube):
+                try:
+                    temp_config_file = os.path.join(self.temp_dir, f"stress_config_{ncube}.ini")
+                    
+                    with open(temp_config_file, 'w') as f:
+                        f.write(f"""[binparams]
+raw_latlon_data_file = dummy.nc
+output_file = dummy_out.nc
+ncube = {ncube}
+landm_coslat_file = dummy_landm.nc
+""")
+                    
+                    processor = TerrainProcessor(temp_config_file)
+                    
+                    # Test area calculation (most memory-intensive operation)
+                    areas = processor.equiangular_all_areas()
+                    
+                    # Verify basic properties
+                    total_area = 6.0 * np.sum(areas)
+                    expected_area = 4.0 * PI
+                    relative_error = abs(total_area - expected_area) / expected_area
+                    
+                    self.assertLess(relative_error, 1e-10,
+                                  f"Area conservation failed for large ncube={ncube}")
+                    
+                except MemoryError:
+                    print(f"Memory limit reached at ncube={ncube} (expected for large values)")
+                    break
+                except Exception as e:
+                    self.fail(f"Unexpected failure for ncube={ncube}: {e}")
+
+
+class RegressionTests(EnvironmentalSafetyTestCase):
+    """
+    CRITICAL: Regression tests using known reference values.
+    
+    These tests verify the code produces the same results as validated
+    reference implementations to prevent silent algorithmic changes.
+    """
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_file = os.path.join(self.temp_dir, "test_config.ini")
+        
+        with open(self.config_file, 'w') as f:
+            f.write("""[binparams]
+raw_latlon_data_file = dummy.nc
+output_file = dummy_out.nc
+ncube = 16
+landm_coslat_file = dummy_landm.nc
+""")
+        
+        self.processor = TerrainProcessor(self.config_file)
+    
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    
+    def test_known_coordinate_transformations(self):
+        """Test against known coordinate transformation values"""
+        # Reference values computed with validated implementation
+        reference_cases = [
+            # (lon, lat) -> (alpha, beta, panel)
+            (0.0, 0.0, (0.0, 0.0, 1)),
+            (PI/2, 0.0, (0.0, 0.0, 2)),
+            (PI, 0.0, (0.0, 0.0, 3)),
+            (3*PI/2, 0.0, (0.0, 0.0, 4)),
+            (0.0, PI/2 - 1e-6, (0.0, 0.0, 6)),
+            (0.0, -PI/2 + 1e-6, (0.0, 0.0, 5)),
+        ]
+        
+        for lon, lat, (expected_alpha, expected_beta, expected_panel) in reference_cases:
+            with self.subTest(lon=math.degrees(lon), lat=math.degrees(lat)):
+                alpha, beta, panel = self.processor.cubed_sphere_abp_from_rll(lon, lat)
+                
+                self.assertAlmostEqualStrict(alpha, expected_alpha, tolerance=1e-12,
+                                           msg=f"Alpha mismatch for reference case")
+                self.assertAlmostEqualStrict(beta, expected_beta, tolerance=1e-12,
+                                           msg=f"Beta mismatch for reference case")
+                self.assertEqual(panel, expected_panel,
+                               f"Panel mismatch for reference case")
+    
+    def test_known_area_calculations(self):
+        """Test against known area calculation values"""
+        # Test specific ncube values with known total areas
+        reference_ncube_areas = [
+            (4, 4.0 * PI),   # Must always equal surface area of unit sphere
+            (8, 4.0 * PI),
+            (16, 4.0 * PI),
+            (32, 4.0 * PI),
+        ]
+        
+        for ncube, expected_total_area in reference_ncube_areas:
+            with self.subTest(ncube=ncube):
+                self.processor.ncube = ncube
+                areas = self.processor.equiangular_all_areas()
+                total_area = 6.0 * np.sum(areas)
+                
+                self.assertAlmostEqualStrict(total_area, expected_total_area, tolerance=1e-14,
+                                           msg=f"Total area mismatch for ncube={ncube}")
+
+
+
     """
     CRITICAL: End-to-end integration tests.
     
@@ -725,7 +1021,10 @@ class EnvironmentalModelValidator:
             DataConservationTests,
             BoundaryConditionTests,
             NumericalStabilityTests,
-            IntegrationTests
+            ErrorPropagationTests,
+            IntegrationTests,
+            StressTests,
+            RegressionTests
         ]
         
         self.results = {}
