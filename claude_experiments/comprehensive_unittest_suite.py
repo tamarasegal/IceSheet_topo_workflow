@@ -1005,7 +1005,189 @@ landm_coslat_file = {self.landm_file}
             self.fail(f"Performance test failed: {e}")
 
 
-class EnvironmentalModelValidator:
+class IntegrationTests(EnvironmentalSafetyTestCase):
+    """
+    CRITICAL: End-to-end integration tests.
+    
+    Tests the complete pipeline with realistic data to ensure
+    the entire system works correctly in production scenarios.
+    """
+    
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.config_file = os.path.join(self.temp_dir, "test_config.ini")
+        
+        # Create realistic test data
+        self.im, self.jm = 144, 72  # 2.5° resolution
+        self.ncube = 48
+        
+        self.terrain_file = os.path.join(self.temp_dir, "terrain.nc")
+        self.landm_file = os.path.join(self.temp_dir, "landm.nc")
+        self.output_file = os.path.join(self.temp_dir, "output.nc")
+        
+        self._create_realistic_test_data()
+        
+        with open(self.config_file, 'w') as f:
+            f.write(f"""[binparams]
+raw_latlon_data_file = {self.terrain_file}
+output_file = {self.output_file}
+ncube = {self.ncube}
+landm_coslat_file = {self.landm_file}
+""")
+    
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+    
+    def _create_realistic_test_data(self):
+        """Create realistic test data mimicking real Earth data"""
+        # Create coordinate arrays
+        lon = np.linspace(0, 360, self.im, endpoint=False)
+        lat = np.linspace(-90, 90, self.jm)
+        
+        lon_2d, lat_2d = np.meshgrid(lon, lat)
+        
+        # Create realistic terrain elevation using multiple scales
+        terrain = np.zeros_like(lat_2d)
+        
+        # Add continent-like features
+        for center_lon, center_lat, height, width in [
+            (0, 45, 2000, 30),      # European-like feature
+            (100, 30, 4000, 40),    # Asian-like feature  
+            (-100, 40, 3000, 50),   # North American-like feature
+            (150, -30, 1500, 35),   # Australian-like feature
+        ]:
+            dist = np.sqrt((lon_2d - center_lon)**2 + (lat_2d - center_lat)**2)
+            terrain += height * np.exp(-(dist/width)**2)
+        
+        # Add noise to simulate real data
+        terrain += np.random.normal(0, 100, terrain.shape)
+        
+        # Create realistic land fraction
+        landfrac = np.where(terrain > 0, 
+                           0.8 + 0.2 * np.random.random(terrain.shape),  # Land
+                           0.1 * np.random.random(terrain.shape))        # Ocean
+        
+        landfrac = np.clip(landfrac, 0.0, 1.0).astype(np.float32)
+        terrain = terrain.astype(np.float32)
+        
+        # Create terrain NetCDF file
+        with nc.Dataset(self.terrain_file, 'w') as ncfile:
+            ncfile.createDimension('lon', self.im)
+            ncfile.createDimension('lat', self.jm)
+            
+            lon_var = ncfile.createVariable('lon', 'f8', ('lon',))
+            lat_var = ncfile.createVariable('lat', 'f8', ('lat',))
+            terrain_var = ncfile.createVariable('htopo', 'f4', ('lat', 'lon'))
+            landfrac_var = ncfile.createVariable('landfract', 'f4', ('lat', 'lon'))
+            
+            lon_var[:] = lon
+            lat_var[:] = lat
+            terrain_var[:] = terrain
+            landfrac_var[:] = landfrac
+            
+            terrain_var.units = 'm'
+            landfrac_var.units = '1'
+        
+        # Create LANDM_COSLAT file
+        landm_coslat = 0.5 * (1 + np.cos(np.radians(lat_2d)) * np.sin(np.radians(lon_2d)))
+        landm_coslat = landm_coslat.astype(np.float64)
+        
+        with nc.Dataset(self.landm_file, 'w') as ncfile:
+            ncfile.createDimension('lon', self.im)
+            ncfile.createDimension('lat', self.jm)
+            
+            lon_var = ncfile.createVariable('lon', 'f8', ('lon',))
+            lat_var = ncfile.createVariable('lat', 'f8', ('lat',))
+            landm_var = ncfile.createVariable('LANDM_COSLAT', 'f8', ('lat', 'lon'))
+            
+            lon_var[:] = lon
+            lat_var[:] = lat
+            landm_var[:] = landm_coslat
+    
+    def test_complete_pipeline_execution(self):
+        """
+        CRITICAL TEST: Verify complete pipeline executes without errors.
+        
+        This tests the entire workflow from input to output with realistic data.
+        """
+        try:
+            processor = TerrainProcessor(self.config_file)
+            
+            # Execute complete pipeline
+            processor.run()
+            
+            # Verify output file was created
+            self.assertTrue(os.path.exists(self.output_file), "Output file not created")
+            
+            # Verify output file structure
+            with nc.Dataset(self.output_file, 'r') as ncfile:
+                # Check required dimensions
+                self.assertIn('grid_size', ncfile.dimensions)
+                expected_grid_size = 6 * self.ncube * self.ncube
+                actual_grid_size = len(ncfile.dimensions['grid_size'])
+                self.assertEqual(actual_grid_size, expected_grid_size,
+                               f"Wrong grid size: {actual_grid_size} != {expected_grid_size}")
+                
+                # Check required variables
+                required_vars = ['lat', 'lon', 'terr', 'LANDFRAC', 'LANDM_COSLAT', 'var30']
+                for var in required_vars:
+                    self.assertIn(var, ncfile.variables, f"Missing output variable: {var}")
+                
+                # Check data ranges are physically realistic
+                lat_data = ncfile.variables['lat'][:]
+                lon_data = ncfile.variables['lon'][:]
+                terr_data = ncfile.variables['terr'][:]
+                landfrac_data = ncfile.variables['LANDFRAC'][:]
+                
+                self.assertTrue(np.all((-90 <= lat_data) & (lat_data <= 90)), "Invalid latitude values")
+                self.assertTrue(np.all((0 <= lon_data) & (lon_data < 360)), "Invalid longitude values")
+                self.assertTrue(np.all((-15000 <= terr_data) & (terr_data <= 15000)), "Unrealistic terrain values")
+                self.assertTrue(np.all((0 <= landfrac_data) & (landfrac_data <= 1)), "Invalid land fraction values")
+                
+                # Check for NaN values
+                self.assertFalse(np.any(np.isnan(lat_data)), "NaN values in latitude")
+                self.assertFalse(np.any(np.isnan(lon_data)), "NaN values in longitude")
+                self.assertFalse(np.any(np.isnan(terr_data)), "NaN values in terrain")
+                self.assertFalse(np.any(np.isnan(landfrac_data)), "NaN values in land fraction")
+        
+        except Exception as e:
+            self.fail(f"Complete pipeline test failed: {e}")
+    
+    def test_performance_and_memory_safety(self):
+        """
+        CRITICAL TEST: Verify performance and memory usage are acceptable.
+        
+        The code must run within reasonable time and memory limits.
+        """
+        process = psutil.Process(os.getpid())
+        initial_memory = process.memory_info().rss
+        
+        start_time = time.time()
+        
+        try:
+            processor = TerrainProcessor(self.config_file)
+            processor.run()
+            
+            end_time = time.time()
+            final_memory = process.memory_info().rss
+            
+            # Performance checks
+            execution_time = end_time - start_time
+            memory_increase = (final_memory - initial_memory) / 1024**2  # MB
+            
+            # Reasonable limits for test data size
+            self.assertLess(execution_time, 300,  # 5 minutes max for test
+                          f"Execution too slow: {execution_time:.1f}s")
+            
+            self.assertLess(memory_increase, 2048,  # 2GB max increase
+                          f"Memory usage too high: {memory_increase:.1f}MB")
+            
+        except Exception as e:
+            self.fail(f"Performance test failed: {e}")
+
+
+
     """
     Centralized validation controller for environmental modeling code.
     
