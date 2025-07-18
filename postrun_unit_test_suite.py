@@ -1268,11 +1268,8 @@ if __name__ == "__main__":
         __file__,
         "-v",  # Verbose output
         "--tb=short",  # Short traceback format
-        "--durations=10",  # Show 10 slowest tests
-        "--cov=cam_topo_regen",  # Coverage for main module
-        "--cov-report=html",  # HTML coverage report
-        "--cov-report=term-missing",  # Terminal coverage report
-    ]
+        "--durations=10"  # Show 10 slowest tests
+   ]
     
     # Run with coverage if available
     try:
